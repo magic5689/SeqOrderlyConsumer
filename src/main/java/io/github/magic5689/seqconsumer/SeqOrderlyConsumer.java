@@ -24,11 +24,11 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * }</pre>
  */
 public class SeqOrderlyConsumer {
-    private final ConcurrentHashMap<Integer, PriorityBlockingQueue<ConsumerTask>> queueMap = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<Integer, Integer> seq = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<Integer, TaskConsumerTime> timeOutMap = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<Integer, ScheduleTimeWheel.DelayTask> delayTaskMap = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<Integer, AtomicBoolean> consumerGuard = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, PriorityBlockingQueue<ConsumerTask>> queueMap = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Integer> seq = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, TaskConsumerTime> timeOutMap = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, ScheduleTimeWheel.DelayTask> delayTaskMap = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, AtomicBoolean> consumerGuard = new ConcurrentHashMap<>();
     private final ScheduleTimeWheel wheel;
     private final ExecutorService executor;
 
@@ -48,7 +48,7 @@ public class SeqOrderlyConsumer {
         this.executor = executorService;
     }
 
-    public void clear(Integer sessionId) {
+    public void clear(String sessionId) {
         queueMap.remove(sessionId);
         seq.remove(sessionId);
         timeOutMap.remove(sessionId);
@@ -68,9 +68,11 @@ public class SeqOrderlyConsumer {
      * @param lastTask       whether this is the final task of the session
      * @param waitTimeSecond timeout in seconds; if the expected next seqNo
      *                       doesn't arrive within this window the task is force-executed
+     * @param execute        if false, the task acts as a placeholder: it advances
+     *                       the sequence counter but its runnable is never invoked
      */
-    public void submitTask(Runnable runnable, Integer sessionId, int seqNo,
-                           boolean lastTask, long waitTimeSecond) {
+    public void submitTask(Runnable runnable, String sessionId, int seqNo,
+                           boolean lastTask, long waitTimeSecond,boolean execute) {
         if (seqNo <= 0) {
             throw new IllegalArgumentException("seqNo must be > 0");
         }
@@ -85,6 +87,7 @@ public class SeqOrderlyConsumer {
             task.setSessionId(sessionId);
             task.setSeqNo(seqNo);
             task.setLastTask(lastTask);
+            task.setExecute(execute);
             v.add(task);
 
             ScheduleTimeWheel.DelayTask delayTask1 = delayTaskMap.get(sessionId);
@@ -110,7 +113,9 @@ public class SeqOrderlyConsumer {
                     System.out.printf("Task session=%s seq=%s timed out%n",
                             consumerTask.getSessionId(), consumerTask.getSeqNo());
                     seq.computeIfPresent(consumerTask.getSessionId(), (k1, v1) -> v1 + 1);
-                    consumerTask.runnable.run();
+                    if (consumerTask.isExecute()) {
+                        consumerTask.runnable.run();
+                    }
                 }
             }, waitTimeSecond, TimeUnit.SECONDS);
 
@@ -136,7 +141,7 @@ public class SeqOrderlyConsumer {
             ConsumerTask task = queue.peek();
             if (task == null) break;
             synchronized (task) {
-                Integer sessionId = task.getSessionId();
+                String sessionId = task.getSessionId();
                 Integer currentSeq = seq.get(sessionId);
                 if (currentSeq == null) {
                     queue.poll();
@@ -144,7 +149,9 @@ public class SeqOrderlyConsumer {
                 }
                 if (seq.get(task.getSessionId()).equals(task.getSeqNo())) {
                     queue.poll();
-                    task.runnable.run();
+                    if (task.isExecute()) {
+                        task.runnable.run();
+                    }
                     if (task.isLastTask()) {
                         clear(task.getSessionId());
                         return;
@@ -180,9 +187,26 @@ public class SeqOrderlyConsumer {
 
     private static class ConsumerTask {
         private Runnable runnable;
-        private Integer sessionId;
+        private String sessionId;
         private int seqNo;
         private boolean lastTask;
+        private boolean execute;
+
+        public boolean isExecute() {
+            return execute;
+        }
+
+        public void setExecute(boolean execute) {
+            this.execute = execute;
+        }
+
+        public String getSessionId() {
+            return sessionId;
+        }
+
+        public void setSessionId(String sessionId) {
+            this.sessionId = sessionId;
+        }
 
         public boolean isLastTask() {
             return lastTask;
@@ -208,12 +232,6 @@ public class SeqOrderlyConsumer {
             this.runnable = runnable;
         }
 
-        public Integer getSessionId() {
-            return sessionId;
-        }
 
-        public void setSessionId(Integer sessionId) {
-            this.sessionId = sessionId;
-        }
     }
 }
