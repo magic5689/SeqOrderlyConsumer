@@ -16,12 +16,9 @@ Common scenarios: trading system callbacks, payment result processing, IoT comma
 
 ```
 Session "order-42":
-  submitTask(seqNo=1) ──► runs immediately
-  submitTask(seqNo=3) ──► waits for seqNo=2...
-                             │
-  ┌─ timeout (30s) ─────────┘
-  │  seqNo=3 force-executed
-  ▼
+  submitTask(seqNo=1, execute=true)  ──► runs immediately
+  submitTask(seqNo=2, execute=false) ──► placeholder, advances seq to 2
+  submitTask(seqNo=3, execute=true)  ──► runs after seq reaches 3
 ```
 
 Internally, a `PriorityBlockingQueue` orders tasks by `seqNo` within each session, while a [hashed time wheel](src/main/java/io/github/magic5689/seqconsumer/ScheduleTimeWheel.java) (lock-free MPSC slots via CAS) triggers timeout fallback so no session gets stuck indefinitely.
@@ -33,14 +30,23 @@ Internally, a `PriorityBlockingQueue` orders tasks by `seqNo` within each sessio
 SeqOrderlyConsumer consumer = new SeqOrderlyConsumer();
 
 // 2. Submit ordered tasks for session "1001"
-consumer.submitTask(() -> processStep1(), 1001, 1, false, 30);
-consumer.submitTask(() -> processStep2(), 1001, 2, false, 30);
-consumer.submitTask(() -> processStep3(), 1001, 3, true,  30);
+consumer.submitTask(() -> processStep1(), "1001", 1, false, 30, true);
+consumer.submitTask(() -> processStep2(), "1001", 2, false, 30, true);
+consumer.submitTask(() -> processStep3(), "1001", 3, true,  30, true);
 // Step1 → Step2 → Step3 execute in order.
 // If Step2 never arrives, Step3 fires after 30s timeout.
 
 // 3. Cleanup after session completes (optional — auto-cleared on lastTask)
-consumer.clear(1001);
+consumer.clear("1001");
+```
+
+### Using `execute=false` as a placeholder
+
+```java
+consumer.submitTask(() -> step1(), "s1", 1, false, 30, true);
+consumer.submitTask(null,          "s1", 2, false, 30, false); // skip seqNo=2
+consumer.submitTask(() -> step3(), "s1", 3, true,  30, true);
+// step1 → (seq=2 skipped, runnable never called) → step3
 ```
 
 ## API
@@ -50,24 +56,30 @@ consumer.clear(1001);
 | Constructor | Description |
 |---|---|
 | `new SeqOrderlyConsumer()` | Default: 1s-tick, 4-slot time wheel, cached thread pool |
-| `new SeqOrderlyConsumer(ScheduleTimeWheel)` | Custom time wheel |
+| `new SeqOrderlyConsumer(ExecutorService)` | Custom executor, default time wheel |
+| `new SeqOrderlyConsumer(ScheduleTimeWheel)` | Custom time wheel, cached thread pool |
 | `new SeqOrderlyConsumer(ScheduleTimeWheel, ExecutorService)` | Custom wheel + executor |
 
 ```java
-void submitTask(Runnable runnable, Integer sessionId, int seqNo,
-                boolean lastTask, long waitTimeSecond)
+void submitTask(Runnable runnable, String sessionId, int seqNo,
+                boolean lastTask, long waitTimeSecond, boolean execute)
 ```
 
-- `seqNo` — 1-based, must be consecutive per session
-- `lastTask` — signal that this is the final task; consumer auto-clears the session after executing it
-- `waitTimeSecond` — how long to wait for a missing seqNo before force-executing remaining tasks
+| Parameter | Description |
+|---|---|
+| `runnable` | The task to execute (nullable when `execute=false`) |
+| `sessionId` | Session key — tasks sharing the same key are ordered |
+| `seqNo` | 1-based sequence number, must be consecutive per session |
+| `lastTask` | When true, the session is auto-cleaned after this task completes |
+| `waitTimeSecond` | Timeout in seconds; if the expected next seqNo doesn't arrive within this window, the head task is force-executed |
+| `execute` | When false, the task acts as a placeholder: it advances seq but never calls `runnable` |
 
 ### ScheduleTimeWheel
 
 ```java
 ScheduleTimeWheel wheel = new ScheduleTimeWheel();
 wheel.setWheel(tickInterval, timeUnit, slotCount);
-wheel.addDelaTask(callback, delay, timeUnit);  // returns cancellable DelayTask
+wheel.addDelayTask(callback, delay, timeUnit);  // returns cancellable DelayTask
 wheel.stop();
 ```
 
