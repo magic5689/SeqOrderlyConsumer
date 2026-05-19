@@ -50,11 +50,17 @@ public class ScheduleTimeWheel {
     }
 
     /**
-     * 停止任务
+     * 停止时间轮，等待所有任务执行完毕后返回。
      */
     public void stop(){
-        if (flag.compareAndSet(true, false)) {
-            LockSupport.unpark(wheelThread);
+        if (!flag.compareAndSet(true, false)) {
+            return;
+        }
+        LockSupport.unpark(wheelThread);
+        try {
+            wheelThread.join();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
         System.out.println("时间轮停止运行");
     }
@@ -138,13 +144,13 @@ public class ScheduleTimeWheel {
                 if (!executor.awaitTermination(60, TimeUnit.SECONDS)) {
                     executor.shutdownNow();
                     if (!executor.awaitTermination(10, TimeUnit.SECONDS)) {
-                        throw new IllegalArgumentException("时间轮线程池强制关闭失败");
+                        System.err.println("时间轮线程池强制关闭失败");
                     }
                 }
             }catch (InterruptedException e){
                 executor.shutdownNow();
                 Thread.currentThread().interrupt();
-                throw new IllegalArgumentException("时间轮线程池停止时被中断", e);
+                System.err.println("时间轮线程池停止时被中断");
             }
             System.out.println("时间轮部线程池停止");;
         }

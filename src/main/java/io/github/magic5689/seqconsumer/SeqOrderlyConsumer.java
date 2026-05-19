@@ -13,7 +13,39 @@ public class SeqOrderlyConsumer {
     private final ConcurrentHashMap<String, AtomicBoolean> consumerGuard=new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Thread> consumerThreads=new ConcurrentHashMap<>();
     private final ScheduleTimeWheel wheel;
-    private ExecutorService EXECUTOR;
+    private final ExecutorService EXECUTOR;
+    private volatile boolean stopped;
+
+    public void stop(){
+        stopped = true;
+        for (Thread t : consumerThreads.values()) {
+            if (t != null) {
+                t.interrupt();
+            }
+        }
+        wheel.stop();
+        EStop();
+    }
+
+    private void EStop() {
+        if (EXECUTOR.isShutdown()) {
+            return;
+        }
+
+        EXECUTOR.shutdown();
+
+        try {
+            boolean terminated = EXECUTOR.awaitTermination(60, TimeUnit.SECONDS);
+            if (!terminated) {
+                EXECUTOR.shutdownNow();
+                EXECUTOR.awaitTermination(10, TimeUnit.SECONDS);
+            }
+        } catch (InterruptedException e) {
+            EXECUTOR.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+    }
+
 
     public void clear(String sessionId){
         queueMap.remove(sessionId);
@@ -56,6 +88,7 @@ public class SeqOrderlyConsumer {
      * @param execute        是否执行任务逻辑；false 时仅推进序号，不调用 runnable
      */
     public void submitTask(Runnable runnable,String sessionId,int seqNo,boolean lastTask,long waitTimeSecond,boolean execute){
+        if (stopped) throw new RejectedExecutionException("SeqOrderlyConsumer 已停止");
         if(seqNo<=0)throw new IllegalArgumentException("seqNo必须大于0");
         seq.putIfAbsent(sessionId, 1);
         PriorityBlockingQueue<ConsumerTask> queue = queueMap.compute(sessionId, (k, v) -> {
