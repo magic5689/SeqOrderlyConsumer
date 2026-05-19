@@ -1,7 +1,5 @@
-package com.example.rpcdemo.SEQ;
+package io.github.magic5689.seqconsumer;
 
-import jakarta.annotation.PreDestroy;
-import lombok.Getter;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -12,7 +10,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
 
-@Getter
 public class ScheduleTimeWheel {
     private long wheelPer;
     private MpscTaskQueue[] wheel;
@@ -24,7 +21,7 @@ public class ScheduleTimeWheel {
     public ScheduleTimeWheel(){
         this.wheelThread=new WheelThread();
         this.wheelThread.setDaemon(false);
-        this.executor=Executors.newFixedThreadPool(6);
+        this.executor= Executors.newFixedThreadPool(6);
     }
 
     public ScheduleTimeWheel(ExecutorService executors){
@@ -55,7 +52,6 @@ public class ScheduleTimeWheel {
     /**
      * 停止任务
      */
-    @PreDestroy
     public void stop(){
         if (flag.compareAndSet(true, false)) {
             LockSupport.unpark(wheelThread);
