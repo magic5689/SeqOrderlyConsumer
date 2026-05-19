@@ -120,8 +120,8 @@ public class SeqOrderlyConsumer {
     }
 
     private class TaskConsumerTime{
-        private long lastConsumerTime;
-        private long waitTimeSecond;
+        private volatile long lastConsumerTime;
+        private volatile long waitTimeSecond;
 
         public long getLastConsumerTime() {
             return lastConsumerTime;
