@@ -1,22 +1,28 @@
 package io.github.magic5689.seqconsumer;
 
 import java.util.Comparator;
-import java.util.HashMap;
-import java.util.Map;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.LockSupport;
 
 public class SeqOrderlyConsumer {
     private final ConcurrentHashMap<String,PriorityBlockingQueue<ConsumerTask>> queueMap=new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String,Integer> seq=new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String,TaskConsumerTime> timeOutMap=new ConcurrentHashMap<>();
-    private final Map<String, ScheduleTimeWheel.DelayTask> delayTaskMap=new HashMap<>();
+    private final ConcurrentHashMap<String, ScheduleTimeWheel.DelayTask> delayTaskMap=new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, AtomicBoolean> consumerGuard=new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Thread> consumerThreads=new ConcurrentHashMap<>();
     private final ScheduleTimeWheel wheel;
     private ExecutorService EXECUTOR;
+
     public void clear(String sessionId){
-      queueMap.remove(sessionId);
-      seq.remove(sessionId);
-      timeOutMap.remove(sessionId);
-      delayTaskMap.remove(sessionId);
+        queueMap.remove(sessionId);
+        seq.remove(sessionId);
+        timeOutMap.remove(sessionId);
+        consumerGuard.remove(sessionId);
+        consumerThreads.remove(sessionId);
+        ScheduleTimeWheel.DelayTask dt=delayTaskMap.remove(sessionId);
+        if(dt!=null) dt.cancel();
     }
 
     public SeqOrderlyConsumer(){
@@ -26,6 +32,7 @@ public class SeqOrderlyConsumer {
     }
     public SeqOrderlyConsumer(ScheduleTimeWheel wheel){
         this.wheel=wheel;
+        this.EXECUTOR=Executors.newCachedThreadPool();
     }
     public SeqOrderlyConsumer(ScheduleTimeWheel wheel, ExecutorService executorService){
         this.wheel=wheel;
@@ -49,7 +56,7 @@ public class SeqOrderlyConsumer {
      * @param execute        是否执行任务逻辑；false 时仅推进序号，不调用 runnable
      */
     public void submitTask(Runnable runnable,String sessionId,int seqNo,boolean lastTask,long waitTimeSecond,boolean execute){
-        if(seqNo<=0)throw new IllegalArgumentException("sessionId必须大于0");
+        if(seqNo<=0)throw new IllegalArgumentException("seqNo必须大于0");
         seq.putIfAbsent(sessionId, 1);
         PriorityBlockingQueue<ConsumerTask> queue = queueMap.compute(sessionId, (k, v) -> {
             //添加任务到有序队列
@@ -73,9 +80,9 @@ public class SeqOrderlyConsumer {
                 PriorityBlockingQueue<ConsumerTask> tasks = queueMap.get(sessionId);
                 if(tasks==null)return;
                 ConsumerTask consumerTask = tasks.poll();
-                TaskConsumerTime consumerTime = timeOutMap.get(sessionId);
-                if(consumerTime.getLastConsumerTime()==-1)return;
                 if(consumerTask==null)return;
+                TaskConsumerTime consumerTime = timeOutMap.get(sessionId);
+                if(consumerTime==null||consumerTime.getLastConsumerTime()==-1)return;
                 long currentTime = System.currentTimeMillis();
                 long lastConsumerTime = consumerTime.getLastConsumerTime();
                 if (currentTime > lastConsumerTime) {
@@ -84,14 +91,38 @@ public class SeqOrderlyConsumer {
                     if(consumerTask.isExecute()) {
                         consumerTask.runnable.run();
                     }
+                    //唤醒消费者继续推进
+                    wakeConsumer(sessionId);
                 }
             }, waitTimeSecond, TimeUnit.SECONDS);
             //存放当前延时任务的引用
             delayTaskMap.put(sessionId,delayTask);
             return v;
         });
-        EXECUTOR.submit(() -> startConsumer(queue));
+
+        //新任务入队后唤醒消费者
+        wakeConsumer(sessionId);
+
+        //确保每个 session 只有一个消费者线程
+        AtomicBoolean guard=consumerGuard.computeIfAbsent(sessionId, k -> new AtomicBoolean(false));
+        if(guard.compareAndSet(false, true)){
+            EXECUTOR.submit(() -> {
+                consumerThreads.put(sessionId, Thread.currentThread());
+                try {
+                    startConsumer(queue);
+                }finally {
+                    consumerThreads.remove(sessionId);
+                    guard.set(false);
+                }
+            });
+        }
     }
+
+    private void wakeConsumer(String sessionId){
+        Thread t=consumerThreads.get(sessionId);
+        if(t!=null) LockSupport.unpark(t);
+    }
+
     private void startConsumer(PriorityBlockingQueue<ConsumerTask> queue){
         while (true) {
             ConsumerTask task = queue.peek();
@@ -103,23 +134,31 @@ public class SeqOrderlyConsumer {
                     queue.poll();
                     continue;
                 }
-                if (seq.get(task.getSessionId()).equals(task.getSeqNo())) {
+                if (seq.get(sessionId).equals(task.getSeqNo())) {
                     queue.poll();
-                    task.runnable.run();
+                    if(task.isExecute()) {
+                        task.runnable.run();
+                    }
                     if(task.isLastTask()){
-                        clear(task.getSessionId());
+                        clear(sessionId);
                         return;
                     }
                     //更新当前任务的消费时间
-                    timeOutMap.get(task.getSessionId()).setLastConsumerTime(System.currentTimeMillis());
-                    seq.computeIfPresent(task.getSessionId(), (k, v) -> v + 1);
+                    timeOutMap.get(sessionId).setLastConsumerTime(System.currentTimeMillis());
+                    seq.computeIfPresent(sessionId, (k, v) -> v + 1);
+                } else {
+                    //序号缺口：阻塞等待新任务到达或超时唤醒，避免忙等
+                    LockSupport.parkNanos(TimeUnit.SECONDS.toNanos(1));
+                    if(Thread.interrupted()){
+                        return;
+                    }
                 }
                 if (queue.isEmpty()) return;
             }
         }
     }
 
-    private class TaskConsumerTime{
+    private static class TaskConsumerTime{
         private volatile long lastConsumerTime;
         private volatile long waitTimeSecond;
 
@@ -139,7 +178,7 @@ public class SeqOrderlyConsumer {
             this.waitTimeSecond = waitTimeSecond;
         }
     }
-    private class ConsumerTask{
+    private static class ConsumerTask{
         private Runnable runnable;
         private String sessionId;
         private int seqNo;
